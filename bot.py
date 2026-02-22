@@ -78,12 +78,16 @@ WEEKDAY_LABELS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 class SetupStates(StatesGroup):
     waiting_rate = State()
     waiting_goal = State()
+    waiting_gamification_choice = State()
     waiting_manual_time = State()
     waiting_new_rate = State()
     waiting_new_goal = State()
     waiting_market_edit_price = State()
-    waiting_points_per_minute = State()
+    waiting_silver_per_hour = State()
+    waiting_gold_per_hour = State()
+    waiting_gold_to_silver_rate = State()
     waiting_bonus_points = State()
+    waiting_exchange_gold_amount = State()
     waiting_market_quick_item = State()
     waiting_market_quick_photo = State()
     waiting_bonus_goal_value = State()
@@ -99,8 +103,12 @@ class Profile:
     goal_amount: float
     notifications_mode: str
     notifications_hour: int
-    points_balance: int
-    points_per_minute: int
+    gamification_enabled: bool
+    silver_balance: int
+    gold_balance: int
+    silver_per_hour: int
+    gold_per_hour: int
+    gold_to_silver_rate: int
 
 
 @dataclass
@@ -109,6 +117,7 @@ class MarketItem:
     user_id: int
     title: str
     cost_points: int
+    cost_currency: str
     description: str
     photo_file_id: str
     is_active: bool
@@ -172,8 +181,14 @@ def init_db() -> None:
                 goal_amount REAL NOT NULL DEFAULT 0,
                 notifications_mode TEXT NOT NULL DEFAULT 'off',
                 notifications_hour INTEGER NOT NULL DEFAULT 21,
+                gamification_enabled INTEGER NOT NULL DEFAULT 1,
                 points_balance INTEGER NOT NULL DEFAULT 0,
                 points_per_minute INTEGER NOT NULL DEFAULT 1,
+                silver_balance INTEGER NOT NULL DEFAULT 0,
+                gold_balance INTEGER NOT NULL DEFAULT 0,
+                silver_per_hour INTEGER NOT NULL DEFAULT 60,
+                gold_per_hour INTEGER NOT NULL DEFAULT 4,
+                gold_to_silver_rate INTEGER NOT NULL DEFAULT 12,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -184,10 +199,26 @@ def init_db() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN notifications_mode TEXT NOT NULL DEFAULT 'off'")
         if "notifications_hour" not in columns:
             conn.execute("ALTER TABLE users ADD COLUMN notifications_hour INTEGER NOT NULL DEFAULT 21")
+        if "gamification_enabled" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN gamification_enabled INTEGER NOT NULL DEFAULT 1")
         if "points_balance" not in columns:
             conn.execute("ALTER TABLE users ADD COLUMN points_balance INTEGER NOT NULL DEFAULT 0")
         if "points_per_minute" not in columns:
             conn.execute("ALTER TABLE users ADD COLUMN points_per_minute INTEGER NOT NULL DEFAULT 1")
+        if "silver_balance" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN silver_balance INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE users SET silver_balance = points_balance")
+        if "gold_balance" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN gold_balance INTEGER NOT NULL DEFAULT 0")
+        if "silver_per_hour" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN silver_per_hour INTEGER NOT NULL DEFAULT 60")
+            conn.execute(
+                "UPDATE users SET silver_per_hour = CASE WHEN points_per_minute > 0 THEN points_per_minute * 60 ELSE 60 END"
+            )
+        if "gold_per_hour" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN gold_per_hour INTEGER NOT NULL DEFAULT 4")
+        if "gold_to_silver_rate" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN gold_to_silver_rate INTEGER NOT NULL DEFAULT 12")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS work_sessions (
@@ -229,6 +260,7 @@ def init_db() -> None:
                 user_id INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 cost_points INTEGER NOT NULL,
+                cost_currency TEXT NOT NULL DEFAULT 'silver',
                 description TEXT NOT NULL DEFAULT '',
                 photo_file_id TEXT NOT NULL DEFAULT '',
                 is_active INTEGER NOT NULL DEFAULT 1,
@@ -238,12 +270,16 @@ def init_db() -> None:
             )
             """
         )
+        market_item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(market_items)").fetchall()}
+        if "cost_currency" not in market_item_columns:
+            conn.execute("ALTER TABLE market_items ADD COLUMN cost_currency TEXT NOT NULL DEFAULT 'silver'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS point_transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 delta_points INTEGER NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'silver',
                 reason TEXT NOT NULL,
                 ref_type TEXT,
                 ref_id INTEGER,
@@ -253,6 +289,9 @@ def init_db() -> None:
             )
             """
         )
+        point_columns = {row["name"] for row in conn.execute("PRAGMA table_info(point_transactions)").fetchall()}
+        if "currency" not in point_columns:
+            conn.execute("ALTER TABLE point_transactions ADD COLUMN currency TEXT NOT NULL DEFAULT 'silver'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS market_purchases (
@@ -261,11 +300,17 @@ def init_db() -> None:
                 item_id INTEGER,
                 item_title_snapshot TEXT NOT NULL,
                 cost_points INTEGER NOT NULL,
+                cost_currency TEXT NOT NULL DEFAULT 'silver',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(user_id)
             )
             """
         )
+        market_purchase_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(market_purchases)").fetchall()
+        }
+        if "cost_currency" not in market_purchase_columns:
+            conn.execute("ALTER TABLE market_purchases ADD COLUMN cost_currency TEXT NOT NULL DEFAULT 'silver'")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS bonus_goals (
@@ -413,8 +458,20 @@ def get_profile(user_id: int) -> Optional[Profile]:
         goal_amount=row["goal_amount"],
         notifications_mode=row["notifications_mode"] if "notifications_mode" in row_keys else "off",
         notifications_hour=row["notifications_hour"] if "notifications_hour" in row_keys else 21,
-        points_balance=int(row["points_balance"]) if "points_balance" in row_keys else 0,
-        points_per_minute=int(row["points_per_minute"]) if "points_per_minute" in row_keys else 1,
+        gamification_enabled=bool(int(row["gamification_enabled"])) if "gamification_enabled" in row_keys else True,
+        silver_balance=(
+            int(row["silver_balance"])
+            if "silver_balance" in row_keys
+            else int(row["points_balance"]) if "points_balance" in row_keys else 0
+        ),
+        gold_balance=int(row["gold_balance"]) if "gold_balance" in row_keys else 0,
+        silver_per_hour=(
+            int(row["silver_per_hour"])
+            if "silver_per_hour" in row_keys
+            else int(row["points_per_minute"]) * 60 if "points_per_minute" in row_keys else 60
+        ),
+        gold_per_hour=int(row["gold_per_hour"]) if "gold_per_hour" in row_keys else 4,
+        gold_to_silver_rate=int(row["gold_to_silver_rate"]) if "gold_to_silver_rate" in row_keys else 12,
     )
 
 
@@ -439,12 +496,18 @@ def upsert_profile(user_id: int, rate_per_hour: float, goal_amount: float) -> No
                     goal_amount,
                     notifications_mode,
                     notifications_hour,
+                    gamification_enabled,
                     points_balance,
                     points_per_minute,
+                    silver_balance,
+                    gold_balance,
+                    silver_per_hour,
+                    gold_per_hour,
+                    gold_to_silver_rate,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, 'off', 21, 0, 1, ?, ?)
+                VALUES (?, ?, ?, 'off', 21, 1, 0, 1, 0, 0, 60, 4, 12, ?, ?)
                 """,
                 (user_id, rate_per_hour, goal_amount, now_iso(), now_iso()),
             )
@@ -474,19 +537,106 @@ def update_notification_mode(user_id: int, mode: str) -> None:
         )
 
 
-def update_points_per_minute(user_id: int, value: int) -> None:
+def update_gamification_enabled(user_id: int, enabled: bool) -> None:
     with db_conn() as conn:
         conn.execute(
-            "UPDATE users SET points_per_minute = ?, updated_at = ? WHERE user_id = ?",
+            "UPDATE users SET gamification_enabled = ?, updated_at = ? WHERE user_id = ?",
+            (1 if enabled else 0, now_iso(), user_id),
+        )
+
+
+def update_silver_per_hour(user_id: int, value: int) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE users SET silver_per_hour = ?, updated_at = ? WHERE user_id = ?",
             (value, now_iso(), user_id),
         )
 
 
-def calculate_session_points(duration_seconds: int, points_per_minute: int) -> int:
-    if duration_seconds <= 0 or points_per_minute <= 0:
+def update_gold_per_hour(user_id: int, value: int) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE users SET gold_per_hour = ?, updated_at = ? WHERE user_id = ?",
+            (value, now_iso(), user_id),
+        )
+
+
+def update_gold_to_silver_rate(user_id: int, value: int) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE users SET gold_to_silver_rate = ?, updated_at = ? WHERE user_id = ?",
+            (value, now_iso(), user_id),
+        )
+
+
+def calculate_session_currency(duration_seconds: int, per_hour: int) -> int:
+    if duration_seconds <= 0 or per_hour <= 0:
         return 0
-    points = (duration_seconds * points_per_minute) // 60
-    return max(1, points)
+    amount = (duration_seconds * per_hour) // 3600
+    return max(1, amount)
+
+
+def normalize_currency(value: str) -> str:
+    return "gold" if (value or "").strip().lower() == "gold" else "silver"
+
+
+def currency_icon(currency: str) -> str:
+    return "🥇" if normalize_currency(currency) == "gold" else "🥈"
+
+
+def currency_name_ru(currency: str) -> str:
+    return "золото" if normalize_currency(currency) == "gold" else "серебро"
+
+
+def profile_balance_by_currency(profile: Profile, currency: str) -> int:
+    return profile.gold_balance if normalize_currency(currency) == "gold" else profile.silver_balance
+
+
+def balance_column(currency: str) -> str:
+    normalized = normalize_currency(currency)
+    if normalized == "silver":
+        return "silver_balance"
+    if normalized == "gold":
+        return "gold_balance"
+    raise ValueError("Unsupported currency")
+
+
+def apply_currency_transaction(
+    user_id: int,
+    delta_points: int,
+    reason: str,
+    currency: str = "silver",
+    note: str = "",
+    ref_type: str = "",
+    ref_id: Optional[int] = None,
+    allow_negative: bool = False,
+) -> tuple[bool, int]:
+    column = balance_column(currency)
+    with db_conn() as conn:
+        row = conn.execute(
+            f"SELECT {column} AS balance FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return False, 0
+
+        current_balance = int(row["balance"])
+        new_balance = current_balance + delta_points
+        if not allow_negative and new_balance < 0:
+            return False, current_balance
+
+        conn.execute(
+            f"UPDATE users SET {column} = ?, updated_at = ? WHERE user_id = ?",
+            (new_balance, now_iso(), user_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO point_transactions (user_id, delta_points, currency, reason, ref_type, ref_id, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, delta_points, currency, reason, ref_type, ref_id, note, now_iso()),
+        )
+        return True, new_balance
 
 
 def apply_points_transaction(
@@ -498,59 +648,64 @@ def apply_points_transaction(
     ref_id: Optional[int] = None,
     allow_negative: bool = False,
 ) -> tuple[bool, int]:
+    return apply_currency_transaction(
+        user_id=user_id,
+        delta_points=delta_points,
+        reason=reason,
+        currency="silver",
+        note=note,
+        ref_type=ref_type,
+        ref_id=ref_id,
+        allow_negative=allow_negative,
+    )
+
+
+def award_currencies_for_session(
+    user_id: int,
+    duration_seconds: int,
+    source: str,
+    session_id: int,
+) -> tuple[int, int]:
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT points_balance FROM users WHERE user_id = ?",
+            """
+            SELECT silver_balance, gold_balance, silver_per_hour, gold_per_hour
+            FROM users
+            WHERE user_id = ?
+            """,
             (user_id,),
         ).fetchone()
         if not row:
-            return False, 0
+            return 0, 0
 
-        current_balance = int(row["points_balance"])
-        new_balance = current_balance + delta_points
-        if not allow_negative and new_balance < 0:
-            return False, current_balance
+        silver = calculate_session_currency(duration_seconds, int(row["silver_per_hour"]))
+        gold = calculate_session_currency(duration_seconds, int(row["gold_per_hour"]))
+        if silver <= 0 and gold <= 0:
+            return 0, 0
 
+        new_silver = int(row["silver_balance"]) + silver
+        new_gold = int(row["gold_balance"]) + gold
         conn.execute(
-            "UPDATE users SET points_balance = ?, updated_at = ? WHERE user_id = ?",
-            (new_balance, now_iso(), user_id),
+            "UPDATE users SET silver_balance = ?, gold_balance = ?, updated_at = ? WHERE user_id = ?",
+            (new_silver, new_gold, now_iso(), user_id),
         )
-        conn.execute(
-            """
-            INSERT INTO point_transactions (user_id, delta_points, reason, ref_type, ref_id, note, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, delta_points, reason, ref_type, ref_id, note, now_iso()),
-        )
-        return True, new_balance
-
-
-def award_points_for_session(user_id: int, duration_seconds: int, source: str, session_id: int) -> int:
-    with db_conn() as conn:
-        row = conn.execute(
-            "SELECT points_balance, points_per_minute FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-        if not row:
-            return 0
-
-        points = calculate_session_points(duration_seconds, int(row["points_per_minute"]))
-        if points <= 0:
-            return 0
-
-        new_balance = int(row["points_balance"]) + points
-        conn.execute(
-            "UPDATE users SET points_balance = ?, updated_at = ? WHERE user_id = ?",
-            (new_balance, now_iso(), user_id),
-        )
-        conn.execute(
-            """
-            INSERT INTO point_transactions (user_id, delta_points, reason, ref_type, ref_id, note, created_at)
-            VALUES (?, ?, 'work_session', 'work_session', ?, ?, ?)
-            """,
-            (user_id, points, session_id, source, now_iso()),
-        )
-        return points
+        if silver > 0:
+            conn.execute(
+                """
+                INSERT INTO point_transactions (user_id, delta_points, currency, reason, ref_type, ref_id, note, created_at)
+                VALUES (?, ?, 'silver', 'work_session', 'work_session', ?, ?, ?)
+                """,
+                (user_id, silver, session_id, source, now_iso()),
+            )
+        if gold > 0:
+            conn.execute(
+                """
+                INSERT INTO point_transactions (user_id, delta_points, currency, reason, ref_type, ref_id, note, created_at)
+                VALUES (?, ?, 'gold', 'work_session', 'work_session', ?, ?, ?)
+                """,
+                (user_id, gold, session_id, source, now_iso()),
+            )
+        return silver, gold
 
 
 def add_session(user_id: int, duration_seconds: int, source: str, note: str = "") -> int:
@@ -652,9 +807,11 @@ def create_market_item(
     user_id: int,
     title: str,
     cost_points: int,
+    cost_currency: str = "silver",
     description: str = "",
     photo_file_id: str = "",
 ) -> int:
+    normalized_currency = normalize_currency(cost_currency)
     with db_conn() as conn:
         cur = conn.execute(
             """
@@ -662,25 +819,37 @@ def create_market_item(
                 user_id,
                 title,
                 cost_points,
+                cost_currency,
                 description,
                 photo_file_id,
                 is_active,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
-            (user_id, title, cost_points, description, photo_file_id, now_iso(), now_iso()),
+            (
+                user_id,
+                title,
+                cost_points,
+                normalized_currency,
+                description,
+                photo_file_id,
+                now_iso(),
+                now_iso(),
+            ),
         )
     return int(cur.lastrowid)
 
 
 def row_to_market_item(row: sqlite3.Row) -> MarketItem:
+    row_keys = set(row.keys())
     return MarketItem(
         id=int(row["id"]),
         user_id=int(row["user_id"]),
         title=row["title"],
         cost_points=int(row["cost_points"]),
+        cost_currency=normalize_currency(row["cost_currency"]) if "cost_currency" in row_keys else "silver",
         description=row["description"] or "",
         photo_file_id=row["photo_file_id"] or "",
         is_active=bool(row["is_active"]),
@@ -737,6 +906,20 @@ def update_market_item_price(user_id: int, item_id: int, new_price: int) -> bool
     return cur.rowcount > 0
 
 
+def update_market_item_currency(user_id: int, item_id: int, new_currency: str) -> bool:
+    currency = normalize_currency(new_currency)
+    with db_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE market_items
+            SET cost_currency = ?, updated_at = ?
+            WHERE user_id = ? AND id = ?
+            """,
+            (currency, now_iso(), user_id, item_id),
+        )
+    return cur.rowcount > 0
+
+
 def toggle_market_item(user_id: int, item_id: int) -> Optional[bool]:
     with db_conn() as conn:
         row = conn.execute(
@@ -762,58 +945,60 @@ def delete_market_item(user_id: int, item_id: int) -> bool:
     return cur.rowcount > 0
 
 
-def buy_market_item(user_id: int, item_id: int) -> tuple[bool, str, int]:
+def buy_market_item(user_id: int, item_id: int) -> tuple[bool, str, int, str]:
     with db_conn() as conn:
         item_row = conn.execute(
             """
-            SELECT id, title, cost_points, is_active
+            SELECT id, title, cost_points, cost_currency, is_active
             FROM market_items
             WHERE user_id = ? AND id = ?
             """,
             (user_id, item_id),
         ).fetchone()
         if not item_row or int(item_row["is_active"]) != 1:
-            return False, "Позиция недоступна", 0
+            return False, "Позиция недоступна", 0, "silver"
 
         profile_row = conn.execute(
-            "SELECT points_balance FROM users WHERE user_id = ?",
+            "SELECT silver_balance, gold_balance FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if not profile_row:
-            return False, "Профиль не найден", 0
+            return False, "Профиль не найден", 0, "silver"
 
         cost = int(item_row["cost_points"])
-        current_balance = int(profile_row["points_balance"])
+        currency = normalize_currency(item_row["cost_currency"])
+        balance_col = balance_column(currency)
+        current_balance = int(profile_row[balance_col])
         if current_balance < cost:
-            return False, "Недостаточно очков", current_balance
+            return False, f"Недостаточно {currency_name_ru(currency)}", current_balance, currency
 
         new_balance = current_balance - cost
         conn.execute(
-            "UPDATE users SET points_balance = ?, updated_at = ? WHERE user_id = ?",
+            f"UPDATE users SET {balance_col} = ?, updated_at = ? WHERE user_id = ?",
             (new_balance, now_iso(), user_id),
         )
         conn.execute(
             """
-            INSERT INTO point_transactions (user_id, delta_points, reason, ref_type, ref_id, note, created_at)
-            VALUES (?, ?, 'market_purchase', 'market_item', ?, ?, ?)
+            INSERT INTO point_transactions (user_id, delta_points, currency, reason, ref_type, ref_id, note, created_at)
+            VALUES (?, ?, ?, 'market_purchase', 'market_item', ?, ?, ?)
             """,
-            (user_id, -cost, int(item_row["id"]), item_row["title"], now_iso()),
+            (user_id, -cost, currency, int(item_row["id"]), item_row["title"], now_iso()),
         )
         conn.execute(
             """
-            INSERT INTO market_purchases (user_id, item_id, item_title_snapshot, cost_points, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO market_purchases (user_id, item_id, item_title_snapshot, cost_points, cost_currency, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (user_id, int(item_row["id"]), item_row["title"], cost, now_iso()),
+            (user_id, int(item_row["id"]), item_row["title"], cost, currency, now_iso()),
         )
-    return True, item_row["title"], new_balance
+    return True, item_row["title"], new_balance, currency
 
 
 def recent_market_purchases(user_id: int, limit: int = 20):
     with db_conn() as conn:
         rows = conn.execute(
             """
-            SELECT item_title_snapshot, cost_points, created_at
+            SELECT item_title_snapshot, cost_points, cost_currency, created_at
             FROM market_purchases
             WHERE user_id = ?
             ORDER BY id DESC
@@ -828,7 +1013,7 @@ def recent_points_activity(user_id: int, limit: int = 20):
     with db_conn() as conn:
         rows = conn.execute(
             """
-            SELECT delta_points, reason, note, created_at
+            SELECT delta_points, currency, reason, note, created_at
             FROM point_transactions
             WHERE user_id = ?
             ORDER BY id DESC
@@ -837,6 +1022,53 @@ def recent_points_activity(user_id: int, limit: int = 20):
             (user_id, limit),
         ).fetchall()
     return rows
+
+
+def exchange_gold_to_silver(user_id: int, gold_amount: int) -> tuple[bool, str, int, int]:
+    if gold_amount <= 0:
+        return False, "Количество золота должно быть больше 0.", 0, 0
+
+    with db_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT gold_balance, silver_balance, gold_to_silver_rate
+            FROM users
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return False, "Профиль не найден.", 0, 0
+
+        current_gold = int(row["gold_balance"])
+        current_silver = int(row["silver_balance"])
+        rate = max(1, int(row["gold_to_silver_rate"]))
+        if current_gold < gold_amount:
+            return False, "Недостаточно золота.", current_gold, current_silver
+
+        silver_gain = gold_amount * rate
+        new_gold = current_gold - gold_amount
+        new_silver = current_silver + silver_gain
+
+        conn.execute(
+            "UPDATE users SET gold_balance = ?, silver_balance = ?, updated_at = ? WHERE user_id = ?",
+            (new_gold, new_silver, now_iso(), user_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO point_transactions (user_id, delta_points, currency, reason, ref_type, ref_id, note, created_at)
+            VALUES (?, ?, 'gold', 'exchange_gold_to_silver', 'exchange', NULL, ?, ?)
+            """,
+            (user_id, -gold_amount, f"обмен по курсу {rate}", now_iso()),
+        )
+        conn.execute(
+            """
+            INSERT INTO point_transactions (user_id, delta_points, currency, reason, ref_type, ref_id, note, created_at)
+            VALUES (?, ?, 'silver', 'exchange_gold_to_silver', 'exchange', NULL, ?, ?)
+            """,
+            (user_id, silver_gain, f"обмен по курсу {rate}", now_iso()),
+        )
+    return True, f"Обменено: {gold_amount} 🥇 -> {silver_gain} 🥈", new_gold, new_silver
 
 
 def update_market_item_photo(user_id: int, item_id: int, photo_file_id: str) -> bool:
@@ -1049,25 +1281,25 @@ def evaluate_bonus_goals(user_id: int) -> list[str]:
                 )
                 if updated.rowcount > 0:
                     user_row = conn.execute(
-                        "SELECT points_balance FROM users WHERE user_id = ?",
+                        "SELECT silver_balance FROM users WHERE user_id = ?",
                         (user_id,),
                     ).fetchone()
                     if user_row:
-                        new_balance = int(user_row["points_balance"]) + goal.reward_points
+                        new_balance = int(user_row["silver_balance"]) + goal.reward_points
                         conn.execute(
-                            "UPDATE users SET points_balance = ?, updated_at = ? WHERE user_id = ?",
+                            "UPDATE users SET silver_balance = ?, updated_at = ? WHERE user_id = ?",
                             (new_balance, now_iso(), user_id),
                         )
                         conn.execute(
                             """
-                            INSERT INTO point_transactions (user_id, delta_points, reason, ref_type, ref_id, note, created_at)
-                            VALUES (?, ?, 'bonus_goal_reward', 'bonus_goal', ?, ?, ?)
+                            INSERT INTO point_transactions (user_id, delta_points, currency, reason, ref_type, ref_id, note, created_at)
+                            VALUES (?, ?, 'silver', 'bonus_goal_reward', 'bonus_goal', ?, ?, ?)
                             """,
                             (user_id, goal.reward_points, goal.id, goal.title, now_iso()),
                         )
                         events.append(
                             f"🏆 <b>Бонус выполнен:</b> {html.escape(goal.title)}\n"
-                            f"⭐ Награда: +{goal.reward_points} очков"
+                            f"🥈 Награда: +{goal.reward_points}"
                         )
                 continue
 
@@ -1363,7 +1595,7 @@ def create_streak_challenge(user_id: int, days_target: int, wager_points: int) -
         allow_negative=False,
     )
     if not ok:
-        return False, "Недостаточно очков для ставки"
+        return False, "Недостаточно серебра для ставки"
 
     state = get_habit_state(user_id)
     today = now_date()
@@ -1419,21 +1651,21 @@ def deduct_points_up_to(
     if desired_points <= 0:
         return 0
     with db_conn() as conn:
-        row = conn.execute("SELECT points_balance FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        row = conn.execute("SELECT silver_balance FROM users WHERE user_id = ?", (user_id,)).fetchone()
         if not row:
             return 0
-        balance = int(row["points_balance"])
+        balance = int(row["silver_balance"])
         deducted = min(balance, desired_points)
         if deducted <= 0:
             return 0
         conn.execute(
-            "UPDATE users SET points_balance = ?, updated_at = ? WHERE user_id = ?",
+            "UPDATE users SET silver_balance = ?, updated_at = ? WHERE user_id = ?",
             (balance - deducted, now_iso(), user_id),
         )
         conn.execute(
             """
-            INSERT INTO point_transactions (user_id, delta_points, reason, ref_type, ref_id, note, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO point_transactions (user_id, delta_points, currency, reason, ref_type, ref_id, note, created_at)
+            VALUES (?, ?, 'silver', ?, ?, ?, ?, ?)
             """,
             (user_id, -deducted, reason, ref_type, ref_id, note, now_iso()),
         )
@@ -1475,7 +1707,7 @@ def evaluate_league_rollover(user_id: int, state: HabitState) -> list[str]:
                 )
             events.append(
                 f"🏟 <b>Лига повышена:</b> {league_name(tier_before)} → {league_name(tier)}\n"
-                f"Неделя: {minutes} мин. Награда: +{reward} ⭐"
+                f"Неделя: {minutes} мин. Награда: +{reward} 🥈"
             )
         elif tier > 1 and minutes < safe_threshold:
             tier -= 1
@@ -1490,7 +1722,7 @@ def evaluate_league_rollover(user_id: int, state: HabitState) -> list[str]:
             )
             events.append(
                 f"⬇️ <b>Лига понижена:</b> {league_name(tier_before)} → {league_name(tier)}\n"
-                f"Неделя: {minutes} мин. Штраф: -{deducted} ⭐"
+                f"Неделя: {minutes} мин. Штраф: -{deducted} 🥈"
             )
 
         stored_week += timedelta(days=7)
@@ -1521,7 +1753,7 @@ def evaluate_discipline(user_id: int) -> list[str]:
             if fail_streak_challenge(user_id, challenge.id):
                 events.append(
                     f"💥 <b>Streak Challenge провален</b>: пропуск рабочего дня.\n"
-                    f"Ставка {challenge.wager_points} ⭐ сгорела."
+                    f"Ставка {challenge.wager_points} 🥈 сгорела."
                 )
             challenge = None
 
@@ -1623,7 +1855,7 @@ def register_activity_day(user_id: int) -> list[str]:
                 if fail_streak_challenge(user_id, challenge.id):
                     events.append(
                         f"💥 <b>Streak Challenge провален</b>: пропуск рабочего дня.\n"
-                        f"Ставка {challenge.wager_points} ⭐ сгорела."
+                        f"Ставка {challenge.wager_points} 🥈 сгорела."
                     )
                 challenge = None
             else:
@@ -1645,7 +1877,7 @@ def register_activity_day(user_id: int) -> list[str]:
             if complete_streak_challenge(user_id, challenge.id, payout):
                 events.append(
                     f"🏁 <b>Streak Challenge завершён</b>: {challenge.days_target} рабочих дней подряд.\n"
-                    f"Награда: +{payout} ⭐"
+                    f"Награда: +{payout} 🥈"
                 )
 
     return events
@@ -1654,7 +1886,7 @@ def register_activity_day(user_id: int) -> list[str]:
 def challenge_progress_text(challenge: StreakChallenge) -> str:
     return (
         f"{challenge.days_done}/{challenge.days_target} раб. дн. "
-        f"(ставка {challenge.wager_points} ⭐, выплата {challenge_payout(challenge.wager_points)} ⭐)"
+        f"(ставка {challenge.wager_points} 🥈, выплата {challenge_payout(challenge.wager_points)} 🥈)"
     )
 
 
@@ -1693,7 +1925,7 @@ def slot_reels_label(reels: tuple[int, int, int]) -> str:
 
 def casino_info_text(user_id: int) -> str:
     profile = get_profile(user_id)
-    balance = profile.points_balance if profile else 0
+    silver_balance = profile.silver_balance if profile else 0
     expected_payout = (
         CASINO_PAYOUTS["pair"] * 36
         + CASINO_PAYOUTS["triple"] * 3
@@ -1703,13 +1935,13 @@ def casino_info_text(user_id: int) -> str:
     edge_percent = int(round(((-expected_net) / CASINO_SPIN_COST) * 100))
     return (
         "🎰 <b>Казино</b>\n"
-        f"⭐ Баланс: <b>{balance}</b>\n"
-        f"Цена спина: <b>{CASINO_SPIN_COST} ⭐</b>\n\n"
-        f"Пара: +{CASINO_PAYOUTS['pair']} ⭐ (36/64)\n"
-        f"Тройка: +{CASINO_PAYOUTS['triple']} ⭐ (3/64)\n"
-        f"Джекпот 777: +{CASINO_PAYOUTS['jackpot']} ⭐ + Freeze (1/64)\n"
+        f"🥈 Баланс: <b>{silver_balance}</b>\n"
+        f"Цена спина: <b>{CASINO_SPIN_COST} 🥈</b>\n\n"
+        f"Пара: +{CASINO_PAYOUTS['pair']} 🥈 (36/64)\n"
+        f"Тройка: +{CASINO_PAYOUTS['triple']} 🥈 (3/64)\n"
+        f"Джекпот 777: +{CASINO_PAYOUTS['jackpot']} 🥈 + Freeze (1/64)\n"
         "Проигрыш: 24/64\n\n"
-        f"Средний итог на дистанции: <b>{expected_net:+.1f} ⭐</b> за спин (edge ~{edge_percent}%)\n\n"
+        f"Средний итог на дистанции: <b>{expected_net:+.1f} 🥈</b> за спин (edge ~{edge_percent}%)\n\n"
         "Режим активен: жми «Крутить» или отправляй 🎰/стикер 🎰."
     )
 
@@ -1718,7 +1950,7 @@ def can_afford_casino_spin(user_id: int) -> bool:
     profile = get_profile(user_id)
     if not profile:
         return False
-    return profile.points_balance >= CASINO_SPIN_COST
+    return profile.silver_balance >= CASINO_SPIN_COST
 
 
 def play_casino_spin(user_id: int, slot_value: int, source: str) -> tuple[bool, str]:
@@ -1736,7 +1968,7 @@ def play_casino_spin(user_id: int, slot_value: int, source: str) -> tuple[bool, 
         allow_negative=False,
     )
     if not ok:
-        return False, f"Недостаточно очков. Нужно {CASINO_SPIN_COST} ⭐"
+        return False, f"Недостаточно серебра. Нужно {CASINO_SPIN_COST} 🥈"
 
     tier, reels = decode_slot_machine_value(slot_value)
     payout = CASINO_PAYOUTS.get(tier, 0)
@@ -1772,8 +2004,8 @@ def play_casino_spin(user_id: int, slot_value: int, source: str) -> tuple[bool, 
 
     text = (
         "🎰 <b>Результат спина</b>\n"
-        f"Итог: <b>{tier_label}</b> ({net_label} ⭐)\n"
-        f"Баланс: <b>{final_balance} ⭐</b>"
+        f"Итог: <b>{tier_label}</b> ({net_label} 🥈)\n"
+        f"Баланс: <b>{final_balance} 🥈</b>"
         f"{bonus_line}"
     )
     return True, text
@@ -1926,7 +2158,8 @@ def parse_forwarded_timer(message_text: str) -> Optional[int]:
 
 
 def summary_text(profile: Profile, user_id: int) -> str:
-    evaluate_discipline(user_id)
+    if profile.gamification_enabled:
+        evaluate_discipline(user_id)
     worked = total_seconds(user_id)
     earned = (worked / 3600) * profile.rate_per_hour
     goal = profile.goal_amount
@@ -1937,36 +2170,43 @@ def summary_text(profile: Profile, user_id: int) -> str:
     if profile.rate_per_hour > 0:
         left_seconds = int((left_money / profile.rate_per_hour) * 3600)
 
+    divider = "────────────"
+    if not profile.gamification_enabled:
+        return (
+            f"🎯 <b>Твоя цель</b>: {fmt_money(goal)} ₽\n"
+            f"💰 <b>Текущий заработок</b>: {fmt_money(earned)} ₽ ({progress}%)\n"
+            f"⏱️ <b>Отработано</b>: {fmt_duration(worked)}\n"
+            f"🧭 <b>Осталось до цели</b>: {fmt_money(left_money)} ₽ | {fmt_duration(left_seconds)}\n\n"
+            f"{divider}\n\n"
+            f"📈 <b>Ставка</b>: {fmt_money(profile.rate_per_hour)} ₽/ч\n\n"
+            "🎮 <b>Геймификация выключена</b>. Включить можно в настройках."
+        )
+
     active_bonus, _, _ = count_bonus_goals(user_id)
     habit = get_habit_state(user_id)
     challenge = get_active_streak_challenge(user_id)
     challenge_line = f"⚔️ <b>Челлендж</b>: {challenge_progress_text(challenge)}\n" if challenge else ""
     return (
-        "🎯 <b>Твоя цель</b>: "
-        f"{fmt_money(goal)} ₽\n"
-        "💰 <b>Текущий заработок</b>: "
-        f"{fmt_money(earned)} ₽ ({progress}%)\n"
-        "⏱ <b>Отработано</b>: "
-        f"{fmt_duration(worked)}\n"
-        "⭐ <b>Баланс очков</b>: "
-        f"{profile.points_balance} (+{profile.points_per_minute}/мин)\n"
-        "🔥 <b>Стрик</b>: "
-        f"{habit.streak_days} дн | 🧊 {habit.streak_freezes}/{MAX_STREAK_FREEZES}\n"
-        "🏟 <b>Лига</b>: "
-        f"{league_name(habit.league_tier)}\n"
-        "🏁 <b>Активные бонус-цели</b>: "
-        f"{active_bonus}\n"
-        "🧭 <b>Осталось до цели</b>: "
-        f"{fmt_money(left_money)} ₽ | {fmt_duration(left_seconds)}\n"
-        "📈 <b>Ставка</b>: "
-        f"{fmt_money(profile.rate_per_hour)} ₽/ч\n"
-        f"{challenge_line}\n"
-        "Остальные детали смотри в разделах «📊 Отчёты» и «🛒 Маркет»."
+        f"🎯 <b>Твоя цель</b>: {fmt_money(goal)} ₽\n"
+        f"💰 <b>Текущий заработок</b>: {fmt_money(earned)} ₽ ({progress}%)\n"
+        f"⏱️ <b>Отработано</b>: {fmt_duration(worked)}\n"
+        f"🧭 <b>Осталось до цели</b>: {fmt_money(left_money)} ₽ | {fmt_duration(left_seconds)}\n\n"
+        f"{divider}\n\n"
+        f"🥈 <b>Серебро</b>: {profile.silver_balance} (+{profile.silver_per_hour}/ч)\n"
+        f"🥇 <b>Золото</b>: {profile.gold_balance} (+{profile.gold_per_hour}/ч)\n\n"
+        f"{divider}\n\n"
+        f"🔥 <b>Стрик</b>: {habit.streak_days} дн | 🧊 {habit.streak_freezes}/{MAX_STREAK_FREEZES}\n"
+        f"🏟 <b>Лига</b>: {league_name(habit.league_tier)}\n"
+        f"🏁 <b>Активные бонус-цели</b>: {active_bonus}\n"
+        f"📈 <b>Ставка</b>: {fmt_money(profile.rate_per_hour)} ₽/ч\n"
+        f"{challenge_line}"
+        "Остальные детали смотри в разделах «📊 Отчёты» и «🎮 Геймификация»."
     )
 
 
 def short_notification_text(profile: Profile, user_id: int) -> str:
-    evaluate_discipline(user_id)
+    if profile.gamification_enabled:
+        evaluate_discipline(user_id)
     now = datetime.now(TZ)
     worked = total_seconds(user_id)
     earned = (worked / 3600) * profile.rate_per_hour
@@ -1974,7 +2214,6 @@ def short_notification_text(profile: Profile, user_id: int) -> str:
     left_seconds = int((left_money / profile.rate_per_hour) * 3600) if profile.rate_per_hour > 0 else 0
 
     deadline = next_payday_deadline(now)
-    active_bonus, _, _ = count_bonus_goals(user_id)
     habit = get_habit_state(user_id)
     days_to_deadline = max(1, (deadline.date() - now.date()).days + 1)
     daily_target = left_money / days_to_deadline
@@ -1983,27 +2222,42 @@ def short_notification_text(profile: Profile, user_id: int) -> str:
         daily_target_seconds = int((daily_target / profile.rate_per_hour) * 3600)
     deadline_label = format_date_ru(deadline)
 
+    divider = "────────────"
+    if not profile.gamification_enabled:
+        return (
+            f"🎯 Цель: {fmt_money(profile.goal_amount)} ₽\n"
+            f"💰 Заработано: {fmt_money(earned)} ₽\n"
+            f"⏱ Осталось до цели: {fmt_duration(left_seconds)}\n\n"
+            f"{divider}\n\n"
+            f"📌 Нужно в день до {deadline_label}: {fmt_duration(daily_target_seconds)} | {fmt_money(daily_target)} ₽\n"
+            "🎮 Геймификация выключена"
+        )
+
+    active_bonus, _, _ = count_bonus_goals(user_id)
     return (
         f"🎯 Цель: {fmt_money(profile.goal_amount)} ₽\n"
         f"💰 Заработано: {fmt_money(earned)} ₽\n"
-        f"⭐ Очки: {profile.points_balance} (+{profile.points_per_minute}/мин)\n"
+        f"⏱ Осталось до цели: {fmt_duration(left_seconds)}\n\n"
+        f"{divider}\n\n"
+        f"🥈 Серебро: {profile.silver_balance} (+{profile.silver_per_hour}/ч)\n"
+        f"🥇 Золото: {profile.gold_balance} (+{profile.gold_per_hour}/ч)\n\n"
+        f"{divider}\n\n"
         f"🔥 Стрик: {habit.streak_days} дн | 🧊 {habit.streak_freezes}/{MAX_STREAK_FREEZES}\n"
         f"🏟 Лига: {league_name(habit.league_tier)}\n"
         f"🏁 Активные бонус-цели: {active_bonus}\n"
-        f"⏱ Осталось до цели: {fmt_duration(left_seconds)}\n"
         f"📌 Нужно в день до {deadline_label}: {fmt_duration(daily_target_seconds)} | {fmt_money(daily_target)} ₽"
     )
 
 
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить время", callback_data="add_time")],
-            [InlineKeyboardButton(text="📊 Отчёты", callback_data="reports")],
-            [InlineKeyboardButton(text="🛒 Маркет", callback_data="market")],
-            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
-        ]
-    )
+def main_menu_kb(gamification_enabled: bool = True) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="➕ Добавить время", callback_data="add_time")],
+        [InlineKeyboardButton(text="📊 Отчёты", callback_data="reports")],
+    ]
+    if gamification_enabled:
+        rows.append([InlineKeyboardButton(text="🎮 Геймификация", callback_data="market")])
+    rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def reports_kb() -> InlineKeyboardMarkup:
@@ -2016,11 +2270,13 @@ def reports_kb() -> InlineKeyboardMarkup:
     )
 
 
-def settings_kb() -> InlineKeyboardMarkup:
+def settings_kb(gamification_enabled: bool = True) -> InlineKeyboardMarkup:
+    toggle_label = "🎮 Геймификация: Вкл" if gamification_enabled else "🎮 Геймификация: Выкл"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💸 Изменить ставку", callback_data="set_rate")],
             [InlineKeyboardButton(text="🎯 Изменить цель", callback_data="set_goal")],
+            [InlineKeyboardButton(text=toggle_label, callback_data="toggle_gamification")],
             [InlineKeyboardButton(text="🔔 Уведомления", callback_data="notifs")],
             [InlineKeyboardButton(text="🧹 Сбросить прогресс", callback_data="reset_progress")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
@@ -2105,21 +2361,23 @@ def market_admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📦 Управление позициями", callback_data="market_manage")],
-            [InlineKeyboardButton(text="🧾 История очков и покупок", callback_data="market_history")],
-            [InlineKeyboardButton(text="⚙️ Экономика очков", callback_data="market_economy")],
+            [InlineKeyboardButton(text="🧾 История валют и покупок", callback_data="market_history")],
+            [InlineKeyboardButton(text="⚙️ Экономика валют", callback_data="market_economy")],
             [InlineKeyboardButton(text="⬅️ Назад в маркет", callback_data="market")],
         ]
     )
 
 
-def market_buy_list_kb(items: list[MarketItem], points_balance: int) -> InlineKeyboardMarkup:
+def market_buy_list_kb(items: list[MarketItem], silver_balance: int, gold_balance: int) -> InlineKeyboardMarkup:
     rows = []
     for item in items:
-        marker = "✅" if points_balance >= item.cost_points else "🔒"
+        current_balance = gold_balance if item.cost_currency == "gold" else silver_balance
+        marker = "✅" if current_balance >= item.cost_points else "🔒"
+        icon = currency_icon(item.cost_currency)
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{marker} {item.title} — {item.cost_points} ⭐",
+                    text=f"{marker} {item.title} — {item.cost_points} {icon}",
                     callback_data=f"market_buy_item:{item.id}",
                 )
             ]
@@ -2138,12 +2396,14 @@ def market_buy_confirm_kb(item_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def market_item_manage_kb(item_id: int, is_active: bool) -> InlineKeyboardMarkup:
+def market_item_manage_kb(item_id: int, is_active: bool, item_currency: str = "silver") -> InlineKeyboardMarkup:
     toggle_label = "🚫 Отключить" if is_active else "✅ Включить"
+    currency_label = f"💱 Валюта: {currency_icon(item_currency)} (сменить)"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=toggle_label, callback_data=f"market_toggle:{item_id}")],
             [InlineKeyboardButton(text="💰 Изменить цену", callback_data=f"market_edit_price:{item_id}")],
+            [InlineKeyboardButton(text=currency_label, callback_data=f"market_edit_currency:{item_id}")],
             [InlineKeyboardButton(text="🗑 Удалить позицию", callback_data=f"market_delete_ask:{item_id}")],
         ]
     )
@@ -2161,9 +2421,24 @@ def market_delete_confirm_kb(item_id: int) -> InlineKeyboardMarkup:
 def market_economy_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎯 Изменить очки за минуту", callback_data="market_set_ppm")],
-            [InlineKeyboardButton(text="🎁 Начислить/списать бонус", callback_data="market_bonus_points")],
+            [InlineKeyboardButton(text="🥈 Курс серебра за час", callback_data="market_set_silver_rate")],
+            [InlineKeyboardButton(text="🥇 Курс золота за час", callback_data="market_set_gold_rate")],
+            [InlineKeyboardButton(text="🔁 Курс обмена (1 🥇 -> ? 🥈)", callback_data="market_set_exchange_rate")],
+            [InlineKeyboardButton(text="🔄 Обменять золото в серебро", callback_data="market_exchange_gold_silver")],
+            [InlineKeyboardButton(text="🎁 Начислить/списать валюту", callback_data="market_bonus_points")],
             [InlineKeyboardButton(text="⬅️ Назад в управление", callback_data="market_admin")],
+        ]
+    )
+
+
+def market_bonus_currency_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🥈 Серебро", callback_data="market_bonus_currency:silver"),
+                InlineKeyboardButton(text="🥇 Золото", callback_data="market_bonus_currency:gold"),
+            ],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="market_cancel")],
         ]
     )
 
@@ -2198,6 +2473,17 @@ def market_cancel_kb() -> InlineKeyboardMarkup:
 def market_back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад в маркет", callback_data="market")]]
+    )
+
+
+def gamification_onboarding_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Включить", callback_data="setup_gamification:on"),
+                InlineKeyboardButton(text="❌ Отключить", callback_data="setup_gamification:off"),
+            ]
+        ]
     )
 
 
@@ -2264,7 +2550,7 @@ def bonus_goal_delete_confirm_kb(goal_id: int) -> InlineKeyboardMarkup:
 
 def discipline_kb(has_active_challenge: bool) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=f"🧊 Купить Freeze ({STREAK_FREEZE_COST} ⭐)", callback_data="discipline_buy_freeze")],
+        [InlineKeyboardButton(text=f"🧊 Купить Freeze ({STREAK_FREEZE_COST} 🥈)", callback_data="discipline_buy_freeze")],
         [InlineKeyboardButton(text="⚔️ Streak Challenge", callback_data="discipline_challenge_menu")],
         [InlineKeyboardButton(text="📅 Рабочие дни и исключения", callback_data="discipline_workdays")],
         [InlineKeyboardButton(text="🏟 Проверить лигу и стрик", callback_data="discipline_check")],
@@ -2281,7 +2567,7 @@ def discipline_challenge_options_kb() -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{days} рабочих дней — ставка {wager} ⭐",
+                    text=f"{days} рабочих дней — ставка {wager} 🥈",
                     callback_data=f"discipline_start_challenge:{days}",
                 )
             ]
@@ -2503,7 +2789,7 @@ async def render_main(bot: Bot, chat_id: int, user_id: int) -> None:
         photo=photo,
         caption=caption,
         parse_mode="HTML",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(profile.gamification_enabled),
     )
     set_main_message_id(user_id, sent.message_id)
 
@@ -2516,14 +2802,18 @@ def market_overview_text(user_id: int) -> str:
     habit = get_habit_state(user_id)
     active_items, total_items = count_market_items(user_id)
     active_bonus, completed_bonus, expired_bonus = count_bonus_goals(user_id)
+    divider = "────────────"
     return (
         "🛒 <b>Внутренний маркет</b>\n"
-        f"⭐ Баланс: <b>{profile.points_balance}</b>\n"
-        f"⏱ Начисление: <b>{profile.points_per_minute} очк./мин</b>\n"
+        f"🥈 Баланс серебра: <b>{profile.silver_balance}</b>\n"
+        f"🥇 Баланс золота: <b>{profile.gold_balance}</b>\n"
+        f"⏱ Доход за час: <b>{profile.silver_per_hour} 🥈</b> и <b>{profile.gold_per_hour} 🥇</b>\n"
+        f"{divider}\n"
         f"📦 Позиции: <b>{active_items}</b> активных из {total_items}\n"
         f"🔥 Стрик: <b>{habit.streak_days}</b> дн | 🧊 {habit.streak_freezes}/{MAX_STREAK_FREEZES}\n"
         f"🏟 Лига: <b>{league_name(habit.league_tier)}</b>\n"
-        f"🎯 Цели: активных <b>{active_bonus}</b>, выполнено <b>{completed_bonus}</b>, просрочено <b>{expired_bonus}</b>\n\n"
+        f"🎯 Цели: активных <b>{active_bonus}</b>, выполнено <b>{completed_bonus}</b>, просрочено <b>{expired_bonus}</b>\n"
+        f"{divider}\n\n"
         "Выбери раздел ниже:"
     )
 
@@ -2555,13 +2845,17 @@ async def render_market_buy_list(bot: Bot, message: Message, user_id: int) -> No
         )
         return
     profile = get_profile(user_id)
-    balance = profile.points_balance if profile else 0
+    silver_balance = profile.silver_balance if profile else 0
+    gold_balance = profile.gold_balance if profile else 0
     await send_temp(
         message,
         user_id,
-        f"💳 Баланс: <b>{balance}</b> ⭐\n\n{market_items_text(user_id, active_only=True, balance=balance)}",
+        (
+            f"💳 Баланс: <b>{silver_balance}</b> 🥈 | <b>{gold_balance}</b> 🥇\n\n"
+            f"{market_items_text(user_id, active_only=True, profile=profile)}"
+        ),
         parse_mode="HTML",
-        reply_markup=market_buy_list_kb(items, balance),
+        reply_markup=market_buy_list_kb(items, silver_balance, gold_balance),
     )
 
 
@@ -2584,9 +2878,10 @@ async def render_market_manage(bot: Bot, message: Message, user_id: int) -> None
         parse_mode="HTML",
     )
     for item in items:
+        icon = currency_icon(item.cost_currency)
         body = (
             f"#{item.id} <b>{html.escape(item.title)}</b>\n"
-            f"⭐ Цена: {item.cost_points}\n"
+            f"{icon} Цена: {item.cost_points}\n"
             f"Статус: {'активна' if item.is_active else 'выключена'}"
         )
         if item.description:
@@ -2598,7 +2893,7 @@ async def render_market_manage(bot: Bot, message: Message, user_id: int) -> None
                 item.photo_file_id,
                 caption=body,
                 parse_mode="HTML",
-                reply_markup=market_item_manage_kb(item.id, item.is_active),
+                reply_markup=market_item_manage_kb(item.id, item.is_active, item.cost_currency),
             )
         else:
             await send_temp(
@@ -2606,7 +2901,7 @@ async def render_market_manage(bot: Bot, message: Message, user_id: int) -> None
                 user_id,
                 body,
                 parse_mode="HTML",
-                reply_markup=market_item_manage_kb(item.id, item.is_active),
+                reply_markup=market_item_manage_kb(item.id, item.is_active, item.cost_currency),
             )
     await send_temp(message, user_id, "Вернуться", reply_markup=market_admin_kb())
 
@@ -2786,7 +3081,16 @@ def parse_signed_int(text: str) -> Optional[int]:
     return value
 
 
-def parse_market_quick_input(text: str) -> Optional[tuple[str, int, str]]:
+def parse_market_currency(text: str) -> Optional[str]:
+    token = (text or "").strip().lower()
+    if token in {"silver", "sil", "s", "серебро", "сер", "🥈"}:
+        return "silver"
+    if token in {"gold", "g", "золото", "зол", "🥇"}:
+        return "gold"
+    return None
+
+
+def parse_market_quick_input(text: str) -> Optional[tuple[str, int, str, str]]:
     cleaned = (text or "").strip()
     if not cleaned:
         return None
@@ -2806,10 +3110,19 @@ def parse_market_quick_input(text: str) -> Optional[tuple[str, int, str]]:
     if not cost:
         return None
 
-    description = parts[2] if len(parts) >= 3 else ""
+    currency = "silver"
+    description = ""
+    if len(parts) >= 3:
+        maybe_currency = parse_market_currency(parts[2])
+        if maybe_currency:
+            currency = maybe_currency
+            description = " ; ".join(parts[3:]).strip() if len(parts) >= 4 else ""
+        else:
+            description = " ; ".join(parts[2:]).strip()
+
     if len(description) > 250:
         return None
-    return title, cost, description
+    return title, cost, currency, description
 
 
 def human_number(value: float, decimals: int = 1) -> str:
@@ -2856,7 +3169,7 @@ def history_text(user_id: int) -> str:
     return "\n".join(lines)
 
 
-def market_items_text(user_id: int, active_only: bool = True, balance: Optional[int] = None) -> str:
+def market_items_text(user_id: int, active_only: bool = True, profile: Optional[Profile] = None) -> str:
     items = list_market_items(user_id, active_only=active_only, limit=50)
     if not items:
         if active_only:
@@ -2866,10 +3179,12 @@ def market_items_text(user_id: int, active_only: bool = True, balance: Optional[
     lines = ["🛍 <b>Доступные позиции</b>"]
     for item in items:
         description = f" — {html.escape(item.description)}" if item.description else ""
+        icon = currency_icon(item.cost_currency)
         availability = ""
-        if balance is not None:
+        if profile is not None:
+            balance = profile_balance_by_currency(profile, item.cost_currency)
             availability = " ✅" if balance >= item.cost_points else " 🔒"
-        lines.append(f"• #{item.id} {html.escape(item.title)}: {item.cost_points} ⭐{availability}{description}")
+        lines.append(f"• #{item.id} {html.escape(item.title)}: {item.cost_points} {icon}{availability}{description}")
     return "\n".join(lines)
 
 
@@ -2881,7 +3196,8 @@ def market_manage_text(user_id: int) -> str:
     lines = ["📦 <b>Управление позициями</b>"]
     for item in items:
         status = "активна" if item.is_active else "выключена"
-        lines.append(f"• #{item.id} {html.escape(item.title)}: {item.cost_points} ⭐ ({status})")
+        icon = currency_icon(item.cost_currency)
+        lines.append(f"• #{item.id} {html.escape(item.title)}: {item.cost_points} {icon} ({status})")
     return "\n".join(lines)
 
 
@@ -2889,11 +3205,15 @@ def market_economy_text(user_id: int) -> str:
     profile = get_profile(user_id)
     if not profile:
         return "Профиль не настроен."
+    divider = "────────────"
     return (
         "🎮 <b>Экономика геймификации</b>\n"
-        f"⭐ Текущий баланс: <b>{profile.points_balance}</b>\n"
-        f"⏱ Очков за минуту: <b>{profile.points_per_minute}</b>\n\n"
-        "Можно изменить скорость начисления и вручную добавить/списать бонусные очки."
+        f"🥈 Серебро: <b>{profile.silver_balance}</b>\n"
+        f"🥇 Золото: <b>{profile.gold_balance}</b>\n"
+        f"⏱ Доход в час: <b>{profile.silver_per_hour} 🥈</b> и <b>{profile.gold_per_hour} 🥇</b>\n"
+        f"{divider}\n"
+        f"🔁 Обмен: <b>1 🥇 = {profile.gold_to_silver_rate} 🥈</b>\n\n"
+        "Бонусы и покупки работают только с серебром. Золото можно только обменять в серебро."
     )
 
 
@@ -2936,11 +3256,13 @@ def discipline_overview_text(user_id: int) -> str:
     today_mode = "рабочий" if is_effective_workday(user_id, today, state) else "нерабочий"
     tomorrow = today + timedelta(days=1)
     tomorrow_mode = "рабочий" if is_effective_workday(user_id, tomorrow, state) else "нерабочий"
+    divider = "────────────"
     return (
         "🔥 <b>Дисциплина (метод кнута)</b>\n"
         f"Стрик: <b>{state.streak_days}</b> дн.\n"
         f"Freeze: <b>{state.streak_freezes}/{MAX_STREAK_FREEZES}</b>\n"
         f"{challenge_line}"
+        f"{divider}\n"
         f"Лига: <b>{league_name(state.league_tier)}</b>\n"
         f"Рабочие дни: <b>{workdays_mask_label(state.workdays_mask)}</b>\n"
         f"Сегодня: {today_mode}, завтра: {tomorrow_mode}\n"
@@ -3010,7 +3332,7 @@ def bonus_goal_card_text(goal: BonusGoal, profile: Profile) -> str:
         f"Тип: {bonus_target_type_label(goal.target_type)}\n"
         f"Прогресс: {progress_label} / {target_label} ({ratio}%)\n"
         f"Осталось: {left_label}\n"
-        f"Награда: +{goal.reward_points} ⭐\n"
+        f"Награда: +{goal.reward_points} 🥈\n"
         f"Дедлайн: {deadline.strftime('%d.%m.%Y %H:%M')}\n"
         f"Статус: {status_label}"
     )
@@ -3021,9 +3343,11 @@ def bonus_goals_overview_text(user_id: int) -> str:
     if not profile:
         return "Профиль не настроен."
     active, completed, expired = count_bonus_goals(user_id)
+    divider = "────────────"
     return (
         "🎯 <b>Бонус-цели</b>\n"
-        f"⭐ Баланс: <b>{profile.points_balance}</b>\n"
+        f"🥈 Баланс серебра: <b>{profile.silver_balance}</b>\n"
+        f"{divider}\n"
         f"• Активные: {active}\n"
         f"• Выполненные: {completed}\n"
         f"• Просроченные: {expired}\n\n"
@@ -3034,7 +3358,7 @@ def bonus_goals_overview_text(user_id: int) -> str:
 def points_activity_text(user_id: int, limit: int = 20) -> str:
     rows = recent_points_activity(user_id, limit=limit)
     if not rows:
-        return "⭐ История очков пока пуста."
+        return "💱 История валют пока пуста."
 
     reason_labels = {
         "work_session": "работа",
@@ -3048,15 +3372,18 @@ def points_activity_text(user_id: int, limit: int = 20) -> str:
         "streak_freeze_purchase": "покупка freeze",
         "casino_bet": "казино ставка",
         "casino_win": "казино выигрыш",
+        "exchange_gold_to_silver": "обмен золота в серебро",
     }
-    lines = ["⭐ <b>История очков</b>"]
+    lines = ["💱 <b>История валют</b>"]
     for row in rows:
         dt = datetime.fromisoformat(row["created_at"]).astimezone(TZ)
         delta = int(row["delta_points"])
         delta_label = f"+{delta}" if delta > 0 else str(delta)
+        currency = row["currency"] if "currency" in row.keys() else "silver"
+        currency_icon = "🥇" if currency == "gold" else "🥈"
         reason = reason_labels.get(row["reason"], row["reason"])
         note = f" ({html.escape(row['note'])})" if row["note"] else ""
-        lines.append(f"• {dt.strftime('%d.%m %H:%M')} | {delta_label} ⭐ | {html.escape(reason)}{note}")
+        lines.append(f"• {dt.strftime('%d.%m %H:%M')} | {delta_label} {currency_icon} | {html.escape(reason)}{note}")
     return "\n".join(lines)
 
 
@@ -3068,8 +3395,9 @@ def purchase_history_text(user_id: int, limit: int = 20) -> str:
     lines = ["🧾 <b>Последние покупки</b>"]
     for row in rows:
         dt = datetime.fromisoformat(row["created_at"]).astimezone(TZ)
+        icon = currency_icon(row["cost_currency"]) if "cost_currency" in row.keys() else "🥈"
         lines.append(
-            f"• {dt.strftime('%d.%m %H:%M')} | {html.escape(row['item_title_snapshot'])} | -{int(row['cost_points'])} ⭐"
+            f"• {dt.strftime('%d.%m %H:%M')} | {html.escape(row['item_title_snapshot'])} | -{int(row['cost_points'])} {icon}"
         )
     return "\n".join(lines)
 
@@ -3084,7 +3412,7 @@ def bonus_goals_archive_text(user_id: int, limit: int = 30) -> str:
         deadline = parse_iso_dt(goal.deadline_at).strftime("%d.%m %H:%M")
         status = "✅" if goal.status == "completed" else "⌛"
         lines.append(
-            f"• {status} #{goal.id} {html.escape(goal.title)} | {bonus_target_value_label(goal)} | до {deadline} | +{goal.reward_points} ⭐"
+            f"• {status} #{goal.id} {html.escape(goal.title)} | {bonus_target_value_label(goal)} | до {deadline} | +{goal.reward_points} 🥈"
         )
     return "\n".join(lines)
 
@@ -3129,6 +3457,27 @@ def analytics_text(user_id: int) -> str:
 def build_dispatcher(bot: Bot) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
 
+    async def ensure_gamification_enabled(message: Message, state: FSMContext, user_id: int) -> bool:
+        profile = get_profile(user_id)
+        if not profile:
+            return False
+        if profile.gamification_enabled:
+            return True
+        await state.clear()
+        await cleanup_temp_messages(bot, message.chat.id, user_id)
+        await send_temp(
+            message,
+            user_id,
+            (
+                "🎮 <b>Геймификация отключена</b>\n"
+                "Монеты продолжают копиться, но игровые разделы скрыты.\n"
+                "Включить можно в «⚙️ Настройки»."
+            ),
+            parse_mode="HTML",
+            reply_markup=settings_kb(False),
+        )
+        return False
+
     async def show_casino_screen(
         message: Message,
         user_id: int,
@@ -3137,7 +3486,7 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
     ) -> None:
         await cleanup_temp_messages(bot, message.chat.id, user_id)
         profile = get_profile(user_id)
-        balance = profile.points_balance if profile else 0
+        balance = profile.silver_balance if profile else 0
         body_parts = []
         if spin_result:
             body_parts.append(spin_result)
@@ -3145,8 +3494,8 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             body_parts.append(casino_info_text(user_id))
         else:
             body_parts.append(
-                f"⭐ Баланс: <b>{balance} ⭐</b>\n"
-                f"Спин: <b>{CASINO_SPIN_COST} ⭐</b>\n"
+                f"🥈 Баланс: <b>{balance} 🥈</b>\n"
+                f"Спин: <b>{CASINO_SPIN_COST} 🥈</b>\n"
                 "Жми «Крутить» для следующего спина."
             )
         body = "\n\n".join(body_parts)
@@ -3175,11 +3524,13 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             return
         if await ensure_setup_for_user(message, state, user_id):
             return
+        if not await ensure_gamification_enabled(message, state, user_id):
+            return
         if not can_afford_casino_spin(user_id):
             await show_casino_screen(
                 message,
                 user_id,
-                f"Недостаточно очков для спина. Нужно {CASINO_SPIN_COST} ⭐",
+                f"Недостаточно серебра для спина. Нужно {CASINO_SPIN_COST} 🥈",
                 include_info=False,
             )
             return
@@ -3212,6 +3563,8 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
         if not message.dice or message.dice.emoji != "🎰":
             return
         if await ensure_setup(message, state):
+            return
+        if not await ensure_gamification_enabled(message, state, message.from_user.id):
             return
         if getattr(message, "forward_origin", None) is not None:
             await show_casino_screen(
@@ -3270,9 +3623,36 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
         profile = get_profile(message.from_user.id)
         rate = profile.rate_per_hour if profile else 0
         upsert_profile(message.from_user.id, rate, value)
-        await state.clear()
         await safe_delete(message)
-        await render_main(bot, message.chat.id, message.from_user.id)
+        await cleanup_temp_messages(bot, message.chat.id, message.from_user.id)
+        await state.set_state(SetupStates.waiting_gamification_choice)
+        await send_temp(
+            message,
+            message.from_user.id,
+            (
+                "🎮 <b>Включить геймификацию?</b>\n"
+                "Если отключишь, останется упрощённый режим: цель, заработок, отчёты и аналитика.\n"
+                "Монеты всё равно будут копиться."
+            ),
+            parse_mode="HTML",
+            reply_markup=gamification_onboarding_kb(),
+        )
+
+    @dp.callback_query(F.data.startswith("setup_gamification:"))
+    async def cb_setup_gamification(callback: CallbackQuery, state: FSMContext):
+        try:
+            mode = callback.data.split(":")[1]
+        except (ValueError, IndexError):
+            await callback.answer("Ошибка выбора", show_alert=True)
+            return
+        if mode not in {"on", "off"}:
+            await callback.answer("Ошибка выбора", show_alert=True)
+            return
+        enabled = mode == "on"
+        update_gamification_enabled(callback.from_user.id, enabled)
+        await state.clear()
+        await callback.answer("Геймификация включена" if enabled else "Геймификация отключена")
+        await render_main(bot, callback.message.chat.id, callback.from_user.id)
 
     @dp.callback_query(F.data == "add_time")
     async def cb_add_time(callback: CallbackQuery, state: FSMContext):
@@ -3296,13 +3676,15 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
         await safe_delete(message)
         profile = get_profile(message.from_user.id)
         added_money = (seconds / 3600) * (profile.rate_per_hour if profile else 0)
-        added_points = calculate_session_points(seconds, profile.points_per_minute if profile else 0)
+        added_silver = calculate_session_currency(seconds, profile.silver_per_hour if profile else 0)
+        added_gold = calculate_session_currency(seconds, profile.gold_per_hour if profile else 0)
         await send_temp(
             message,
             message.from_user.id,
             (
                 f"Распознано: {fmt_duration(seconds)} ({fmt_money(added_money)} ₽)\n"
-                f"⭐ Начислится: +{added_points} очков\n"
+                f"🥈 Начислится: +{added_silver}\n"
+                f"🥇 Начислится: +{added_gold}\n"
                 "Добавляем?"
             ),
             reply_markup=confirm_add_kb(seconds, "manual"),
@@ -3373,25 +3755,34 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
 
     @dp.callback_query(F.data == "market")
     async def cb_market(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await render_market_home(bot, callback.message, callback.from_user.id)
 
     @dp.callback_query(F.data == "market_shop")
     async def cb_market_shop(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
         await send_temp(
             callback.message,
             callback.from_user.id,
-            "🛍 <b>Покупки</b>\nЗдесь можно купить награду или быстро добавить новую позицию.",
+            "🛍 <b>Покупки</b>\nЗдесь можно покупать награды за 🥈/🥇 и быстро добавлять новые позиции.",
             parse_mode="HTML",
             reply_markup=market_shop_kb(),
         )
 
     @dp.callback_query(F.data == "market_game")
     async def cb_market_game(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         prev_state = await state.get_state()
         await state.clear()
@@ -3410,25 +3801,34 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
 
     @dp.callback_query(F.data == "market_admin")
     async def cb_market_admin(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
         await send_temp(
             callback.message,
             callback.from_user.id,
-            "⚙️ <b>Управление</b>\nРедактирование позиций, история и экономика очков.",
+            "⚙️ <b>Управление</b>\nРедактирование позиций, история и экономика валют.",
             parse_mode="HTML",
             reply_markup=market_admin_kb(),
         )
 
     @dp.callback_query(F.data == "casino_info")
     async def cb_casino_info(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.set_state(SetupStates.casino_mode)
         await show_casino_screen(callback.message, callback.from_user.id)
 
     @dp.callback_query(F.data == "casino_spin")
     async def cb_casino_spin(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         if await state.get_state() != SetupStates.casino_mode.state:
             await callback.answer("Открой казино в разделе геймификации.", show_alert=True)
             return
@@ -3437,24 +3837,36 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
 
     @dp.callback_query(F.data == "bonus_goals")
     async def cb_bonus_goals(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await render_bonus_goals_home(bot, callback.message, callback.from_user.id)
 
     @dp.callback_query(F.data == "bonus_check_now")
     async def cb_bonus_check_now(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer("Проверяю цели...")
         await state.clear()
         await render_bonus_goals_home(bot, callback.message, callback.from_user.id)
 
     @dp.callback_query(F.data == "bonus_active")
     async def cb_bonus_active(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await render_bonus_active_goals(bot, callback.message, callback.from_user.id)
 
     @dp.callback_query(F.data == "bonus_archive")
     async def cb_bonus_archive(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         evaluate_discipline(callback.from_user.id)
@@ -3470,6 +3882,9 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
 
     @dp.callback_query(F.data == "bonus_create")
     async def cb_bonus_create(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
@@ -3586,7 +4001,7 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             callback.from_user.id,
             (
                 f"Дедлайн: <b>{deadline_at.strftime('%d.%m.%Y %H:%M')}</b>\n"
-                "Теперь укажи награду в очках (например 40)."
+                "Теперь укажи награду в серебре (например 40)."
             ),
             parse_mode="HTML",
             reply_markup=market_cancel_kb(),
@@ -3612,7 +4027,7 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             message.from_user.id,
             (
                 f"Дедлайн сохранён: <b>{deadline_at.strftime('%d.%m.%Y %H:%M')}</b>\n"
-                "Теперь укажи награду в очках."
+                "Теперь укажи награду в серебре."
             ),
             parse_mode="HTML",
             reply_markup=market_cancel_kb(),
@@ -3720,18 +4135,27 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
 
     @dp.callback_query(F.data == "discipline")
     async def cb_discipline(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await render_discipline_home(bot, callback.message, callback.from_user.id)
 
     @dp.callback_query(F.data == "discipline_check")
     async def cb_discipline_check(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer("Проверяю...")
         await state.clear()
         await render_discipline_home(bot, callback.message, callback.from_user.id)
 
     @dp.callback_query(F.data == "discipline_workdays")
     async def cb_discipline_workdays(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await render_discipline_workdays(bot, callback.message, callback.from_user.id)
@@ -3777,16 +4201,19 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             allow_negative=False,
         )
         if not ok:
-            await callback.answer("Недостаточно очков", show_alert=True)
+            await callback.answer("Недостаточно серебра", show_alert=True)
             return
 
         state.streak_freezes += 1
         save_habit_state(state)
-        await callback.answer(f"Freeze куплен. Баланс: {balance} ⭐")
+        await callback.answer(f"Freeze куплен. Баланс: {balance} 🥈")
         await render_discipline_home(bot, callback.message, callback.from_user.id)
 
     @dp.callback_query(F.data == "discipline_challenge_menu")
     async def cb_discipline_challenge_menu(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         active = get_active_streak_challenge(callback.from_user.id)
@@ -3808,7 +4235,7 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             callback.from_user.id,
             (
                 "⚔️ <b>Streak Challenge</b>\n"
-                "Как в Duolingo: выбираешь серию рабочих дней подряд, ставишь очки и рискуешь ими.\n"
+                "Как в Duolingo: выбираешь серию рабочих дней подряд, ставишь серебро и рискуешь им.\n"
                 "Если пропускаешь рабочий день, ставка сгорает. Freeze не работает."
             ),
             parse_mode="HTML",
@@ -3855,13 +4282,16 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             callback.from_user.id,
             (
                 "💥 Челлендж завершён досрочно.\n"
-                f"Ставка {active.wager_points} ⭐ не возвращается."
+                f"Ставка {active.wager_points} 🥈 не возвращается."
             ),
             reply_markup=discipline_kb(has_active_challenge=False),
         )
 
     @dp.callback_query(F.data == "market_buy")
     async def cb_market_buy(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await render_market_buy_list(bot, callback.message, callback.from_user.id)
@@ -3880,15 +4310,17 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             return
 
         profile = get_profile(callback.from_user.id)
-        balance = profile.points_balance if profile else 0
+        balance = profile_balance_by_currency(profile, item.cost_currency) if profile else 0
+        currency_ru = currency_name_ru(item.cost_currency)
+        icon = currency_icon(item.cost_currency)
         missing = max(0, item.cost_points - balance)
         caption = (
             f"🛍 <b>{html.escape(item.title)}</b>\n"
-            f"⭐ Цена: <b>{item.cost_points}</b>\n"
-            f"💳 Текущий баланс: <b>{balance}</b>"
+            f"{icon} Цена: <b>{item.cost_points}</b>\n"
+            f"💳 Баланс ({currency_ru}): <b>{balance}</b> {icon}"
         )
         if missing > 0:
-            caption += f"\n🔒 Не хватает: <b>{missing}</b> ⭐"
+            caption += f"\n🔒 Не хватает: <b>{missing}</b> {icon}"
         if item.description:
             caption += f"\n📝 {html.escape(item.description)}"
 
@@ -3920,10 +4352,12 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             await callback.answer("Некорректная позиция", show_alert=True)
             return
 
-        success, payload, balance = buy_market_item(callback.from_user.id, item_id)
+        success, payload, balance, item_currency = buy_market_item(callback.from_user.id, item_id)
+        icon = currency_icon(item_currency)
+        currency_ru = currency_name_ru(item_currency)
         if not success:
-            if payload == "Недостаточно очков":
-                await callback.answer(f"Недостаточно очков. Баланс: {balance} ⭐", show_alert=True)
+            if payload.startswith("Недостаточно "):
+                await callback.answer(f"{payload}. Баланс: {balance} {icon}", show_alert=True)
             else:
                 await callback.answer(payload, show_alert=True)
             return
@@ -3933,7 +4367,7 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
         await send_temp(
             callback.message,
             callback.from_user.id,
-            f"✅ Куплено: <b>{html.escape(payload)}</b>\n⭐ Новый баланс: <b>{balance}</b>",
+            f"✅ Куплено: <b>{html.escape(payload)}</b>\n{icon} Новый баланс ({currency_ru}): <b>{balance}</b>",
             parse_mode="HTML",
             reply_markup=market_main_kb(),
         )
@@ -3946,10 +4380,11 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             await callback.answer("Некорректная позиция", show_alert=True)
             return
 
-        success, payload, balance = buy_market_item(callback.from_user.id, item_id)
+        success, payload, balance, item_currency = buy_market_item(callback.from_user.id, item_id)
+        icon = currency_icon(item_currency)
         if not success:
-            if payload == "Недостаточно очков":
-                await callback.answer(f"Недостаточно очков. Баланс: {balance} ⭐", show_alert=True)
+            if payload.startswith("Недостаточно "):
+                await callback.answer(f"{payload}. Баланс: {balance} {icon}", show_alert=True)
             else:
                 await callback.answer(payload, show_alert=True)
             return
@@ -3959,6 +4394,9 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
 
     @dp.callback_query(F.data == "market_add")
     async def cb_market_add(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
         await state.set_state(SetupStates.waiting_market_quick_item)
@@ -3968,10 +4406,11 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             (
                 "⚡ <b>Быстрое добавление позиции</b>\n"
                 "Отправь одной строкой:\n"
-                "<code>Название; цена; описание (опционально)</code>\n\n"
+                "<code>Название; цена; валюта; описание (опционально)</code>\n"
+                "Валюта: <b>silver</b>/<b>🥈</b> или <b>gold</b>/<b>🥇</b>. Если не указать, будет серебро.\n\n"
                 "Примеры:\n"
                 "• <code>YouTube 3 часа; 30</code>\n"
-                "• <code>Кальян; 15; 30 минут отдыха</code>"
+                "• <code>Кальян; 15; gold; 30 минут отдыха</code>"
             ),
             parse_mode="HTML",
             reply_markup=market_cancel_kb(),
@@ -3986,29 +4425,36 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
                 message.from_user.id,
                 (
                     "Формат не распознан.\n"
-                    "Используй: <code>Название; цена; описание</code>\n"
+                    "Используй: <code>Название; цена; валюта; описание</code>\n"
+                    "Валюта опциональна: <code>silver</code>/<code>gold</code>.\n"
                     "Описание можно не указывать."
                 ),
                 parse_mode="HTML",
             )
             return
 
-        title, cost, description = parsed
+        title, cost, item_currency, description = parsed
+        icon = currency_icon(item_currency)
         item_id = create_market_item(
             message.from_user.id,
             title=title,
             cost_points=cost,
+            cost_currency=item_currency,
             description=description,
             photo_file_id="",
         )
-        await state.update_data(quick_item_id=item_id, quick_item_title=title)
+        await state.update_data(
+            quick_item_id=item_id,
+            quick_item_title=title,
+            quick_item_currency=item_currency,
+        )
         await state.set_state(SetupStates.waiting_market_quick_photo)
         await safe_delete(message)
         await send_temp(
             message,
             message.from_user.id,
             (
-                f"✅ Позиция создана: <b>{html.escape(title)}</b> ({cost} ⭐)\n"
+                f"✅ Позиция создана: <b>{html.escape(title)}</b> ({cost} {icon})\n"
                 "Теперь отправь фото для карточки или пропусти."
             ),
             parse_mode="HTML",
@@ -4089,6 +4535,9 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
 
     @dp.callback_query(F.data == "market_manage")
     async def cb_market_manage(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await render_market_manage(bot, callback.message, callback.from_user.id)
@@ -4120,17 +4569,39 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             await callback.answer("Позиция не найдена", show_alert=True)
             return
 
+        icon = currency_icon(item.cost_currency)
         await callback.answer()
         await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
-        await state.update_data(edit_item_id=item.id, edit_item_title=item.title)
+        await state.update_data(edit_item_id=item.id, edit_item_title=item.title, edit_item_currency=item.cost_currency)
         await state.set_state(SetupStates.waiting_market_edit_price)
         await send_temp(
             callback.message,
             callback.from_user.id,
-            f"Новая цена для <b>{html.escape(item.title)}</b> (текущая {item.cost_points} ⭐):",
+            f"Новая цена для <b>{html.escape(item.title)}</b> (текущая {item.cost_points} {icon}):",
             parse_mode="HTML",
             reply_markup=market_cancel_kb(),
         )
+
+    @dp.callback_query(F.data.startswith("market_edit_currency:"))
+    async def cb_market_edit_currency(callback: CallbackQuery):
+        try:
+            item_id = int(callback.data.split(":")[1])
+        except (ValueError, IndexError):
+            await callback.answer("Некорректная позиция", show_alert=True)
+            return
+
+        item = get_market_item(callback.from_user.id, item_id, active_only=False)
+        if not item:
+            await callback.answer("Позиция не найдена", show_alert=True)
+            return
+        new_currency = "gold" if item.cost_currency == "silver" else "silver"
+        if not update_market_item_currency(callback.from_user.id, item_id, new_currency):
+            await callback.answer("Не удалось обновить валюту", show_alert=True)
+            return
+        await callback.answer(
+            f"Валюта: {currency_icon(item.cost_currency)} -> {currency_icon(new_currency)}"
+        )
+        await render_market_manage(bot, callback.message, callback.from_user.id)
 
     @dp.message(SetupStates.waiting_market_edit_price)
     async def market_edit_price_step(message: Message, state: FSMContext):
@@ -4142,6 +4613,8 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
         data = await state.get_data()
         item_id = int(data.get("edit_item_id", 0))
         item_title = str(data.get("edit_item_title", "позиция"))
+        item_currency = normalize_currency(str(data.get("edit_item_currency", "silver")))
+        icon = currency_icon(item_currency)
         if item_id <= 0 or not update_market_item_price(message.from_user.id, item_id, new_price):
             await state.clear()
             await send_temp(message, message.from_user.id, "Не удалось обновить цену. Попробуй снова.")
@@ -4153,7 +4626,7 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
         await send_temp(
             message,
             message.from_user.id,
-            f"✅ Цена обновлена: <b>{html.escape(item_title)}</b> = {new_price} ⭐",
+            f"✅ Цена обновлена: <b>{html.escape(item_title)}</b> = {new_price} {icon}",
             parse_mode="HTML",
             reply_markup=market_main_kb(),
         )
@@ -4196,6 +4669,9 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
 
     @dp.callback_query(F.data == "market_history")
     async def cb_market_history(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
@@ -4215,6 +4691,9 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
 
     @dp.callback_query(F.data.in_({"game_settings", "market_economy"}))
     async def cb_market_economy(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await state.clear()
         await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
@@ -4226,20 +4705,23 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             reply_markup=market_economy_kb(),
         )
 
-    @dp.callback_query(F.data == "market_set_ppm")
-    async def cb_market_set_ppm(callback: CallbackQuery, state: FSMContext):
+    @dp.callback_query(F.data == "market_set_silver_rate")
+    async def cb_market_set_silver_rate(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
         await callback.answer()
         await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
-        await state.set_state(SetupStates.waiting_points_per_minute)
+        await state.set_state(SetupStates.waiting_silver_per_hour)
         await send_temp(
             callback.message,
             callback.from_user.id,
-            "Введи новое начисление очков за минуту (целое число, например 1 или 2).",
+            "Введи новый курс серебра за час (целое число, например 60).",
             reply_markup=market_cancel_kb(),
         )
 
-    @dp.message(SetupStates.waiting_points_per_minute)
-    async def set_points_per_minute_step(message: Message, state: FSMContext):
+    @dp.message(SetupStates.waiting_silver_per_hour)
+    async def set_silver_per_hour_step(message: Message, state: FSMContext):
         value = parse_positive_int(message.text or "")
         if not value:
             await send_temp(message, message.from_user.id, "Нужно целое число больше 0.")
@@ -4248,26 +4730,174 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             await send_temp(message, message.from_user.id, "Слишком большое значение. Укажи до 1000.")
             return
 
-        update_points_per_minute(message.from_user.id, value)
+        update_silver_per_hour(message.from_user.id, value)
         await state.clear()
         await safe_delete(message)
         await cleanup_temp_messages(bot, message.chat.id, message.from_user.id)
         await send_temp(
             message,
             message.from_user.id,
-            f"✅ Начисление обновлено: {value} очк./мин",
+            f"✅ Курс серебра обновлён: {value} 🥈/ч",
+            reply_markup=market_economy_kb(),
+        )
+
+    @dp.callback_query(F.data == "market_set_gold_rate")
+    async def cb_market_set_gold_rate(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
+        await callback.answer()
+        await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
+        await state.set_state(SetupStates.waiting_gold_per_hour)
+        await send_temp(
+            callback.message,
+            callback.from_user.id,
+            "Введи новый курс золота за час (целое число, например 4).",
+            reply_markup=market_cancel_kb(),
+        )
+
+    @dp.message(SetupStates.waiting_gold_per_hour)
+    async def set_gold_per_hour_step(message: Message, state: FSMContext):
+        value = parse_positive_int(message.text or "")
+        if not value:
+            await send_temp(message, message.from_user.id, "Нужно целое число больше 0.")
+            return
+        if value > 1000:
+            await send_temp(message, message.from_user.id, "Слишком большое значение. Укажи до 1000.")
+            return
+
+        update_gold_per_hour(message.from_user.id, value)
+        await state.clear()
+        await safe_delete(message)
+        await cleanup_temp_messages(bot, message.chat.id, message.from_user.id)
+        await send_temp(
+            message,
+            message.from_user.id,
+            f"✅ Курс золота обновлён: {value} 🥇/ч",
+            reply_markup=market_economy_kb(),
+        )
+
+    @dp.callback_query(F.data == "market_set_exchange_rate")
+    async def cb_market_set_exchange_rate(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
+        await callback.answer()
+        await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
+        await state.set_state(SetupStates.waiting_gold_to_silver_rate)
+        await send_temp(
+            callback.message,
+            callback.from_user.id,
+            "Введи курс обмена: сколько серебра даёт 1 золото (например 12).",
+            reply_markup=market_cancel_kb(),
+        )
+
+    @dp.message(SetupStates.waiting_gold_to_silver_rate)
+    async def set_gold_to_silver_rate_step(message: Message, state: FSMContext):
+        value = parse_positive_int(message.text or "")
+        if not value:
+            await send_temp(message, message.from_user.id, "Нужно целое число больше 0.")
+            return
+        if value > 1000:
+            await send_temp(message, message.from_user.id, "Слишком большое значение. Укажи до 1000.")
+            return
+
+        update_gold_to_silver_rate(message.from_user.id, value)
+        await state.clear()
+        await safe_delete(message)
+        await cleanup_temp_messages(bot, message.chat.id, message.from_user.id)
+        await send_temp(
+            message,
+            message.from_user.id,
+            f"✅ Курс обмена обновлён: 1 🥇 = {value} 🥈",
+            reply_markup=market_economy_kb(),
+        )
+
+    @dp.callback_query(F.data == "market_exchange_gold_silver")
+    async def cb_market_exchange_gold_silver(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
+        await callback.answer()
+        profile = get_profile(callback.from_user.id)
+        rate = profile.gold_to_silver_rate if profile else 12
+        await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
+        await state.set_state(SetupStates.waiting_exchange_gold_amount)
+        await send_temp(
+            callback.message,
+            callback.from_user.id,
+            (
+                f"Текущий курс: 1 🥇 = {rate} 🥈\n"
+                "Введи, сколько золота обменять в серебро (целое число)."
+            ),
+            reply_markup=market_cancel_kb(),
+        )
+
+    @dp.message(SetupStates.waiting_exchange_gold_amount)
+    async def exchange_gold_amount_step(message: Message, state: FSMContext):
+        amount = parse_positive_int(message.text or "")
+        if not amount:
+            await send_temp(message, message.from_user.id, "Нужно целое число больше 0.")
+            return
+
+        ok, payload, gold_balance, silver_balance = exchange_gold_to_silver(message.from_user.id, amount)
+        if not ok:
+            await send_temp(message, message.from_user.id, payload)
+            return
+
+        await state.clear()
+        await safe_delete(message)
+        await cleanup_temp_messages(bot, message.chat.id, message.from_user.id)
+        await send_temp(
+            message,
+            message.from_user.id,
+            (
+                f"✅ {payload}\n"
+                f"🥇 Новый баланс: {gold_balance}\n"
+                f"🥈 Новый баланс: {silver_balance}"
+            ),
             reply_markup=market_economy_kb(),
         )
 
     @dp.callback_query(F.data == "market_bonus_points")
     async def cb_market_bonus_points(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
+        await callback.answer()
+        await state.clear()
+        await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
+        await send_temp(
+            callback.message,
+            callback.from_user.id,
+            "Выбери валюту для ручной корректировки.",
+            reply_markup=market_bonus_currency_kb(),
+        )
+
+    @dp.callback_query(F.data.startswith("market_bonus_currency:"))
+    async def cb_market_bonus_currency(callback: CallbackQuery, state: FSMContext):
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            await callback.answer("Геймификация отключена", show_alert=True)
+            return
+        try:
+            raw_currency = callback.data.split(":")[1]
+        except (ValueError, IndexError):
+            await callback.answer("Некорректная валюта", show_alert=True)
+            return
+        selected_currency = parse_market_currency(raw_currency)
+        if not selected_currency:
+            await callback.answer("Некорректная валюта", show_alert=True)
+            return
+        icon = currency_icon(selected_currency)
+        currency_ru = currency_name_ru(selected_currency)
         await callback.answer()
         await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
+        await state.update_data(bonus_currency=selected_currency)
         await state.set_state(SetupStates.waiting_bonus_points)
         await send_temp(
             callback.message,
             callback.from_user.id,
-            "Введи изменение баланса. Примеры: `+30`, `-15`.",
+            f"Введи изменение для {currency_ru}. Примеры: `+30`, `-15` {icon}",
             parse_mode="Markdown",
             reply_markup=market_cancel_kb(),
         )
@@ -4279,15 +4909,21 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             await send_temp(message, message.from_user.id, "Неверный формат. Пример: +30 или -15.")
             return
 
-        success, new_balance = apply_points_transaction(
+        data = await state.get_data()
+        currency = normalize_currency(str(data.get("bonus_currency", "silver")))
+        icon = currency_icon(currency)
+        currency_ru = currency_name_ru(currency)
+
+        success, new_balance = apply_currency_transaction(
             message.from_user.id,
             delta,
             reason="manual_bonus",
+            currency=currency,
             note="ручная корректировка",
             allow_negative=False,
         )
         if not success:
-            await send_temp(message, message.from_user.id, "Недостаточно очков для списания.")
+            await send_temp(message, message.from_user.id, f"Недостаточно {currency_ru} для списания.")
             return
 
         await state.clear()
@@ -4297,7 +4933,7 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
         await send_temp(
             message,
             message.from_user.id,
-            f"✅ Баланс изменён: {delta_label} ⭐\nТекущий баланс: {new_balance} ⭐",
+            f"✅ Баланс {currency_ru} изменён: {delta_label} {icon}\nТекущий баланс: {new_balance} {icon}",
             reply_markup=market_economy_kb(),
         )
 
@@ -4314,6 +4950,8 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
         if current_state in bonus_states:
             await render_bonus_goals_home(bot, callback.message, callback.from_user.id)
             return
+        if not await ensure_gamification_enabled(callback.message, state, callback.from_user.id):
+            return
         await render_market_home(bot, callback.message, callback.from_user.id)
 
     @dp.callback_query(F.data == "settings")
@@ -4321,7 +4959,36 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
         await callback.answer()
         await state.clear()
         await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
-        await send_temp(callback.message, callback.from_user.id, "⚙️ Настройки", reply_markup=settings_kb())
+        profile = get_profile(callback.from_user.id)
+        enabled = profile.gamification_enabled if profile else True
+        status = "включена" if enabled else "выключена"
+        await send_temp(
+            callback.message,
+            callback.from_user.id,
+            f"⚙️ Настройки\n🎮 Геймификация сейчас: <b>{status}</b>",
+            parse_mode="HTML",
+            reply_markup=settings_kb(enabled),
+        )
+
+    @dp.callback_query(F.data == "toggle_gamification")
+    async def cb_toggle_gamification(callback: CallbackQuery, state: FSMContext):
+        profile = get_profile(callback.from_user.id)
+        if not profile:
+            await callback.answer("Профиль не найден", show_alert=True)
+            return
+        new_value = not profile.gamification_enabled
+        update_gamification_enabled(callback.from_user.id, new_value)
+        await callback.answer("Геймификация включена" if new_value else "Геймификация отключена")
+        await state.clear()
+        await cleanup_temp_messages(bot, callback.message.chat.id, callback.from_user.id)
+        status = "включена" if new_value else "выключена"
+        await send_temp(
+            callback.message,
+            callback.from_user.id,
+            f"⚙️ Настройки\n🎮 Геймификация сейчас: <b>{status}</b>",
+            parse_mode="HTML",
+            reply_markup=settings_kb(new_value),
+        )
 
     @dp.callback_query(F.data == "back_main")
     async def cb_back_main(callback: CallbackQuery, state: FSMContext):
@@ -4440,11 +5107,16 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             source,
             "Подтверждено пользователем",
         )
-        points_earned = award_points_for_session(callback.from_user.id, seconds, source, session_id)
-        discipline_events = register_activity_day(callback.from_user.id)
-        bonus_events = evaluate_bonus_goals(callback.from_user.id)
-        if points_earned > 0:
-            await callback.answer(f"Добавлено: +{points_earned} ⭐")
+        silver_earned, gold_earned = award_currencies_for_session(callback.from_user.id, seconds, source, session_id)
+        profile = get_profile(callback.from_user.id)
+        gamification_enabled = profile.gamification_enabled if profile else True
+        discipline_events: list[str] = []
+        bonus_events: list[str] = []
+        if gamification_enabled:
+            discipline_events = register_activity_day(callback.from_user.id)
+            bonus_events = evaluate_bonus_goals(callback.from_user.id)
+        if silver_earned > 0 or gold_earned > 0:
+            await callback.answer(f"Добавлено: +{silver_earned} 🥈 и +{gold_earned} 🥇")
         else:
             await callback.answer("Время добавлено")
         await render_main(bot, callback.message.chat.id, callback.from_user.id)
@@ -4485,13 +5157,15 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             await safe_delete(message)
             profile = get_profile(message.from_user.id)
             added_money = (seconds / 3600) * (profile.rate_per_hour if profile else 0)
-            added_points = calculate_session_points(seconds, profile.points_per_minute if profile else 0)
+            added_silver = calculate_session_currency(seconds, profile.silver_per_hour if profile else 0)
+            added_gold = calculate_session_currency(seconds, profile.gold_per_hour if profile else 0)
             await send_temp(
                 message,
                 message.from_user.id,
                 (
                     f"Распознано из пересланного: {fmt_duration(seconds)} ({fmt_money(added_money)} ₽)\n"
-                    f"⭐ Начислится: +{added_points} очков\n"
+                    f"🥈 Начислится: +{added_silver}\n"
+                    f"🥇 Начислится: +{added_gold}\n"
                     "Добавляем?"
                 ),
                 reply_markup=confirm_add_kb(seconds, "forwarded"),
