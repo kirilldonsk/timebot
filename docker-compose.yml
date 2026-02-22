@@ -1,0 +1,9 @@
+services:
+  timebot:
+    build: .
+    container_name: timebot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data/bot_data.sqlite3:/app/bot_data.sqlite3
