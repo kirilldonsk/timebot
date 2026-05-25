@@ -2147,14 +2147,47 @@ def parse_duration_text(text: str) -> Optional[int]:
     return None
 
 
+TIMER_MARKER_RE = re.compile(r"(?:таймер[^\n]*остановлен)|затрачено", re.IGNORECASE)
+
+FORWARDED_BATCH_DELAY = 1.2
+_forwarded_batches: dict[int, dict] = {}
+
+
 def parse_forwarded_timer(message_text: str) -> Optional[int]:
-    if "таймер остановлен" not in message_text.lower():
+    text = message_text or ""
+    if not TIMER_MARKER_RE.search(text):
         return None
-    match = re.search(r"затрачено\s*(\d{1,2}:\d{2}:\d{2})", message_text.lower(), re.IGNORECASE)
-    if not match:
-        return None
-    h, m, s = map(int, match.group(1).split(":"))
-    return h * 3600 + m * 60 + s
+    line_match = re.search(r"затрачено[^\n]*", text, re.IGNORECASE)
+    target = (line_match.group(0) if line_match else text).lower()
+
+    hhmmss = re.search(r"(\d{1,3}):(\d{2}):(\d{2})", target)
+    if hhmmss:
+        h, m, s = map(int, hhmmss.groups())
+        return h * 3600 + m * 60 + s
+
+    h_match = re.search(r"(\d+)\s*ч", target)
+    m_match = re.search(r"(\d+)\s*м(?!с)", target)
+    s_match = re.search(r"(\d+)\s*с", target)
+    if h_match or m_match or s_match:
+        h = int(h_match.group(1)) if h_match else 0
+        m = int(m_match.group(1)) if m_match else 0
+        s = int(s_match.group(1)) if s_match else 0
+        return h * 3600 + m * 60 + s
+
+    return None
+
+
+def parse_forwarded_timer_label(message_text: str) -> str:
+    text = message_text or ""
+    task_match = re.search(r"задача\s*:?\s*([^\n]+)", text, re.IGNORECASE)
+    if task_match:
+        label = task_match.group(1).strip().strip("—-:").strip()
+        if label:
+            return label
+    num_match = re.search(r"таймер\s*#?(\d+)", text, re.IGNORECASE)
+    if num_match:
+        return f"Таймер #{num_match.group(1)}"
+    return "Таймер"
 
 
 def summary_text(profile: Profile, user_id: int) -> str:
@@ -5145,31 +5178,71 @@ def build_dispatcher(bot: Bot) -> Dispatcher:
             await send_temp(callback.message, callback.from_user.id, "Прогресс и цель удалены. Введи новую цель в рублях.")
             return
 
+    async def _flush_forwarded_batch(user_id: int):
+        try:
+            await asyncio.sleep(FORWARDED_BATCH_DELAY)
+        except asyncio.CancelledError:
+            return
+        batch = _forwarded_batches.pop(user_id, None)
+        if not batch or not batch["entries"]:
+            return
+        entries = batch["entries"]
+        message = batch["message"]
+        total = sum(sec for sec, _ in entries)
+        profile = get_profile(user_id)
+        rate = profile.rate_per_hour if profile else 0
+        added_money = (total / 3600) * rate
+        added_silver = calculate_session_currency(total, profile.silver_per_hour if profile else 0)
+        added_gold = calculate_session_currency(total, profile.gold_per_hour if profile else 0)
+        if len(entries) == 1:
+            text = (
+                f"Распознано из пересланного: {fmt_duration(total)} ({fmt_money(added_money)} ₽)\n"
+                f"🥈 Начислится: +{added_silver}\n"
+                f"🥇 Начислится: +{added_gold}\n"
+                "Добавляем?"
+            )
+        else:
+            lines = "\n".join(
+                f"  {idx}) {label} — {fmt_duration(sec)}"
+                for idx, (sec, label) in enumerate(entries, start=1)
+            )
+            text = (
+                f"📥 Найдено пересланных таймеров: {len(entries)}\n"
+                f"{lines}\n\n"
+                f"🧮 Суммарно: {fmt_duration(total)} ({fmt_money(added_money)} ₽)\n"
+                f"🥈 Начислится: +{added_silver}\n"
+                f"🥇 Начислится: +{added_gold}\n"
+                "Добавляем всё одной записью?"
+            )
+        await send_temp(
+            message,
+            user_id,
+            text,
+            reply_markup=confirm_add_kb(total, "forwarded"),
+        )
+
     @dp.message(F.text)
     async def parse_forwarded(message: Message, state: FSMContext):
         if re.fullmatch(r"\s*🎰\ufe0f?\s*", message.text or ""):
             return
-        # Always react to forwarded timer stop messages.
-        seconds = parse_forwarded_timer(message.text or "")
+        text = message.text or ""
+        seconds = parse_forwarded_timer(text)
         if seconds:
             if await ensure_setup(message, state):
                 return
+            label = parse_forwarded_timer_label(text)
             await safe_delete(message)
-            profile = get_profile(message.from_user.id)
-            added_money = (seconds / 3600) * (profile.rate_per_hour if profile else 0)
-            added_silver = calculate_session_currency(seconds, profile.silver_per_hour if profile else 0)
-            added_gold = calculate_session_currency(seconds, profile.gold_per_hour if profile else 0)
-            await send_temp(
-                message,
-                message.from_user.id,
-                (
-                    f"Распознано из пересланного: {fmt_duration(seconds)} ({fmt_money(added_money)} ₽)\n"
-                    f"🥈 Начислится: +{added_silver}\n"
-                    f"🥇 Начислится: +{added_gold}\n"
-                    "Добавляем?"
-                ),
-                reply_markup=confirm_add_kb(seconds, "forwarded"),
-            )
+            user_id = message.from_user.id
+            batch = _forwarded_batches.get(user_id)
+            if batch is None:
+                batch = {"entries": [], "message": message, "task": None}
+                _forwarded_batches[user_id] = batch
+            else:
+                batch["message"] = message
+                if batch["task"]:
+                    batch["task"].cancel()
+            batch["entries"].append((seconds, label))
+            batch["task"] = asyncio.create_task(_flush_forwarded_batch(user_id))
             return
 
         profile = get_profile(message.from_user.id)
